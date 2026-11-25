@@ -185,9 +185,38 @@ def clean_sales(df_sales: pd.DataFrame) -> pd.DataFrame:
     df["order_date"] = df["order_date"].dt.strftime("%Y-%m-%d")
     logger.info("Nettoyage : %d -> %d commandes", initial, len(df))
     if df.empty:
-        raise DataError("Aucune commande valide après nettoyage.")
+        raise sqlite3.DataError("Aucune commande valide après nettoyage.")
     return df.reset_index(drop=True)
 
+# Normalisation du titre pour la jointure entre les ventes et le catalogue : suppression des espaces superflus et mise en minuscule.
+def normalize_title(title: str) -> str:
+    """Clé de jointure tolérante : espaces et casse ignorés."""
+    return re.sub(r"\s+", " ", str(title)).strip().casefold()
+
+def enrich_sales(sales: pd.DataFrame, catalog: pd.DataFrame, rate: float) -> pd.DataFrame:
+    """Ajoute le prix scrapé puis calcule le chiffre d'affaires en GBP et en EUR.
+
+    revenue_gbp = prix_gbp x quantité x (1 - remise)
+    revenue_eur = revenue_gbp x taux GBP->EUR
+    """
+    catalog = catalog.assign(title_key=catalog["title"].map(normalize_title))
+    catalog = catalog.drop_duplicates("title_key")[["title_key", "price_gbp"]]
+
+    df = sales.assign(title_key=sales["book_name"].map(normalize_title))
+    df = df.merge(catalog, on="title_key", how="left").drop(columns="title_key")
+
+    unmatched = df["price_gbp"].isna()
+    if unmatched.all():
+        raise sqlite3.DataError("Aucun livre des ventes ne correspond au catalogue scrapé.")
+    if unmatched.any():
+        titles = sorted(df.loc[unmatched, "book_name"].unique())
+        logger.warning("%d commande(s) écartée(s), prix introuvable pour : %s",
+                       int(unmatched.sum()), titles)
+        df = df[~unmatched].copy()
+
+    df["revenue_gbp"] = df["price_gbp"] * df["quantity"] * (1 - df["discount_rate"])
+    df["revenue_eur"] = df["revenue_gbp"] * rate
+    return df.reset_index(drop=True)
 
 def run_pipeline():
     # Lecture du csv des ventes

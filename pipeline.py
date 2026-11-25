@@ -50,7 +50,7 @@ def extract_reference():
             con,
         )
         df_categories = pd.read_sql_query(
-            "SELECT category_name, margin_rate, strategic flag, default_channel_code, is_active FROM ctagory_rules",
+            "SELECT category_name, margin_rate, strategic_flag, default_channel_code, is_active FROM category_rules",
             con,
         )
         # Requête avec filtre : pays inactifs
@@ -105,6 +105,29 @@ def scrape_catalog(url: str = CATALOG_URL) -> pd.DataFrame:
         raise ExtractionError("Aucun livre trouvé : la structure de la page a peut-être changé.")
     logger.info("Scraping : %d livres récupérés", len(rows))
     return pd.DataFrame(rows)
+
+def fetch_exchange_rate() -> dict:
+    """Récupère le taux GBP -> EUR via l'API publique Frankfurter."""
+    # Il n'y a pas de ventes hors UE, donc on ne gère pas d'autres devises pour l'instant.
+    # Les pays europèens concernés par les ventes n'utilisent pas d'autres type de devises.
+    last_exc: Exception | None = None
+    for url, params in FRANKFURTER_ENDPOINTS:
+        try:
+            data = _http_get(url, params=params).json()
+            rate = float(data["rates"]["EUR"])
+            if rate <= 0:
+                raise ValueError(f"taux invalide : {rate}")
+            logger.info("Taux de change GBP->EUR : %s (date %s)", rate, data.get("date"))
+            return {
+                "rate_date": str(data["date"]),
+                "base_currency": "GBP",
+                "quote_currency": "EUR",
+                "rate": rate,
+            }
+        except (ExtractionError, KeyError, TypeError, ValueError) as exc:
+            last_exc = exc
+            logger.warning("Endpoint Frankfurter inutilisable (%s) : %s", url, exc)
+    raise ExtractionError("Taux de change indisponible") from last_exc
 
 def run_pipeline():
     # Lecture du csv des ventes

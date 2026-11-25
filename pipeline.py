@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-CSV_VENTES = "sales_raw.csv"
+CSV_VENTES = "base_de_donnees_bookworld.csv"
 DB_REFERENCE = "bookworld_reference.db"
 CATALOG_URL = "https://books.toscrape.com/"
 
@@ -34,17 +34,23 @@ def extract_sales():
 
 def extract_reference():
     """Lit les données de référence dans la base SQLite."""
-    # sqlite3.connect crée une base vide si le fichier n'existe pas : on vérifie avant
+    # sqlite3.connect crée une base vide si le fichier n'existe pas
     if not Path(DB_REFERENCE).exists():
         raise SystemExit(f"Erreur : base introuvable : {DB_REFERENCE}")
 
+    # utiliser closing permet d'ouvrir et de fermer automatiquement la connection à la base sqlite qui doit obligatoirement être fermé.
+    # cette fonction permet la fermeture même en cas d'échec du code.
     with closing(sqlite3.connect(DB_REFERENCE)) as con:
         df_pays = pd.read_sql_query(
-            "SELECT country_code, country_name, currency_code, region FROM countries",
+            "SELECT country_code, country_name, currency_code, region, is_active FROM countries",
             con,
         )
         df_canaux = pd.read_sql_query(
-            "SELECT channel_code, channel_name, channel_group FROM channels",
+            "SELECT channel_code, channel_name, channel_group, is_active FROM channels",
+            con,
+        )
+        df_categories = pd.read_sql_query(
+            "SELECT category_name, margin_rate, strategic flag, default_channel_code, is_active FROM ctagory_rules",
             con,
         )
         # Requête avec filtre : pays inactifs
@@ -57,6 +63,7 @@ def extract_reference():
             "SELECT country_code, country_name FROM countries WHERE is_active = 1",
             con,
         )
+
     return df_pays, df_canaux, df_pays_inactifs, df_pays_actifs
 
 def _http_get(url: str, timeout: int = 10) -> requests.Response:

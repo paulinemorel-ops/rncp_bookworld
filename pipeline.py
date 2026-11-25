@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 CSV_VENTES = "base_de_donnees_bookworld.csv"
 DB_REFERENCE = "bookworld_reference.db"
 CATALOG_URL = "https://books.toscrape.com/"
+PERSONAL_COLUMNS = ["customer_first_name", "customer_last_name"]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,13 +24,17 @@ logger = logging.getLogger(__name__)
 class ExtractionError(Exception):
     """Levée lorsque l'extraction des données du catalogue échoue."""
 
+# ------------------------------------------------------------------------------------------- #
+# 1. Extraction #
+# ------------------------------------------------------------------------------------------- #
+
 def extract_sales():
     """Lit le csv des ventes brutes"""
     try:
-        df_ventes = pd.read_csv(CSV_VENTES)
+        df_sales = pd.read_csv(CSV_VENTES)
     except FileNotFoundError:
         raise SystemExit(f"Erreur : fichier introuvable : {CSV_VENTES}")
-    return df_ventes
+    return df_sales
 
 
 def extract_reference():
@@ -64,7 +69,7 @@ def extract_reference():
             con,
         )
 
-    return df_pays, df_canaux, df_pays_inactifs, df_pays_actifs
+    return df_pays, df_canaux, df_pays_inactifs, df_pays_actifs, df_categories
 
 def _http_get(url: str, timeout: int = 10) -> requests.Response:
     """Effectue une requête HTTP GET avec gestion des erreurs réseau et statuts HTTP."""
@@ -129,13 +134,64 @@ def fetch_exchange_rate() -> dict:
             logger.warning("Endpoint Frankfurter inutilisable (%s) : %s", url, exc)
     raise ExtractionError("Taux de change indisponible") from last_exc
 
+
+# ------------------------------------------------------------------------------------------- #
+# 2. Transformation - Nettoyage - Implementation #
+# ------------------------------------------------------------------------------------------- #
+def clean_sales(df_sales: pd.DataFrame) -> pd.DataFrame:
+    """Nettoie les ventes et retire les données personnelles (RGPD)."""
+    # RGPD : les noms et prénoms ne sont pas nécessaires à l'usage final.
+    df = df_sales.drop(columns=PERSONAL_COLUMNS, errors="ignore").copy()
+    initial = len(df)
+
+    # Retirer les lignes sans identifiant AVANT de convertir en texte : NaN deviendrait la chaîne "nan" et ne serait plus détecté.
+    missing_ids = df["order_id"].isna() | df["book_id"].isna()
+    if missing_ids.any():
+        logger.warning("%d commande(s) sans identifiant écartée(s)", int(missing_ids.sum()))
+    df = df[~missing_ids].copy() # Retirer les lignes sans identifiant
+
+    for col in ["order_id", "book_id", "country_code", "channel_code", "book_name"]:
+        df[col] = df[col].astype(str).str.strip()
+    df["country_code"] = df["country_code"].str.upper()
+    df["channel_code"] = df["channel_code"].str.upper()
+
+    # Retirer les lignes avec identifiant vide s'il y a des espaces ou des chaînes vides
+    empty_ids = (df["order_id"] == "") | (df["book_id"] == "")
+    df = df[~empty_ids].copy() # Retirer les lignes avec identifiant vide
+
+    # Retirer les doublons sur order_id, par défaut la première occurrence est conservée
+    df = df.drop_duplicates(subset="order_id")
+
+    # Nettoyage des colonnes numériques et date (les données invalides sont converties en NaN)
+    df["order_date"] = pd.to_datetime(df["order_date"],format="%d/%m/%Y", errors="coerce")
+    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
+    df["discount_rate"] = pd.to_numeric(df["discount_rate"], errors="coerce")
+
+    # Retirer les lignes invalides : date manquante, quantité <= 0, taux de remise invalide
+    invalid = (
+        df["order_date"].isna()
+        | df["quantity"].isna() | (df["quantity"] <= 0)
+        | df["discount_rate"].isna() | ~df["discount_rate"].between(0, 1)
+    )
+    if invalid.any():
+        logger.warning("%d commande(s) invalide(s) écartée(s)", int(invalid.sum()))
+    df = df[~invalid].copy()
+
+    df["quantity"] = df["quantity"].astype(int)
+    df["order_date"] = df["order_date"].dt.strftime("%Y-%m-%d")
+    logger.info("Nettoyage : %d -> %d commandes", initial, len(df))
+    if df.empty:
+        raise DataError("Aucune commande valide après nettoyage.")
+    return df.reset_index(drop=True)
+
+
 def run_pipeline():
     # Lecture du csv des ventes
     df_ventes = extract_sales()
     print(f"Ventes : {len(df_ventes)} lignes lues")
 
     # Lecture des données de référence (SQLite)
-    df_pays, df_canaux, df_pays_inactifs, df_pays_actifs = extract_reference()
+    df_pays, df_canaux, df_pays_inactifs, df_pays_actifs, df_categories = extract_reference()
     print(f"Pays : {len(df_pays)} | Canaux : {len(df_canaux)}")
     print(f"Pays inactifs : {len(df_pays_inactifs)} | Pays actifs : {len(df_pays_actifs)}")
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -9,17 +11,19 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
+
+#Définition des constantes pour les fichiers et l'URL du catalogue
 CSV_VENTES = "base_de_donnees_bookworld.csv"
 DB_REFERENCE = "bookworld_reference.db"
 CATALOG_URL = "https://books.toscrape.com/"
 PERSONAL_COLUMNS = ["customer_first_name", "customer_last_name"]
 
+#Set up du logging pour afficher les messages d'information et d'erreur
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
-
 
 class ExtractionError(Exception):
     """Levée lorsque l'extraction des données du catalogue échoue."""
@@ -187,8 +191,8 @@ def clean_sales(df_sales: pd.DataFrame) -> pd.DataFrame:
 
 def run_pipeline():
     # Lecture du csv des ventes
-    df_ventes = extract_sales()
-    print(f"Ventes : {len(df_ventes)} lignes lues")
+    df_sales = extract_sales()
+    print(f"Ventes : {len(df_sales)} lignes lues")
 
     # Lecture des données de référence (SQLite)
     df_pays, df_canaux, df_pays_inactifs, df_pays_actifs, df_categories = extract_reference()
@@ -200,9 +204,9 @@ def run_pipeline():
     except ExtractionError as exc:
         raise SystemExit(f"Erreur : {exc}") from exc
 
-    return df_ventes, df_pays, df_canaux, df_catalogue
+    return df_sales, df_pays, df_canaux, df_catalogue
 
 
 if __name__ == "__main__":
-    df_ventes, df_pays, df_canaux, df_catalogue = run_pipeline()
+    df_sales, df_pays, df_canaux, df_catalogue = run_pipeline()
     print("Pipeline exécuté avec succès.")

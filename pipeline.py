@@ -1,32 +1,44 @@
-from __future__ import annotations
-
+import re
 import sqlite3
 from contextlib import closing
 from pathlib import Path
-
-import logging
-import re
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-
-#Définition des constantes pour les fichiers et l'URL du catalogue
+# ------------------------------------------------------------------------------------------- #
+# Constantes #
+# ------------------------------------------------------------------------------------------- #
 CSV_VENTES = "base_de_donnees_bookworld.csv"
 DB_REFERENCE = "bookworld_reference.db"
+FINAL_DB = "bookworld_final.db"
+SCHEMA_FILE = "schema_final.sql"
 CATALOG_URL = "https://books.toscrape.com/"
+FRANKFURTER_URL = "https://api.frankfurter.dev/v1/latest"
+
+# Colonnes à supprimer pour le RGPD : les noms et prénoms ne servent pas à l'indicateur final
 PERSONAL_COLUMNS = ["customer_first_name", "customer_last_name"]
 
-#Set up du logging pour afficher les messages d'information et d'erreur
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
+# Ordre de chargement : les tables "dim_" doivent être remplies AVANT fact_orders,
+# car fact_orders pointe vers elles (clés étrangères).
+LOAD_ORDER = ["dim_country", "dim_channel", "dim_book", "fx_rates", "fact_orders", "sales_by_country"]
 
-class ExtractionError(Exception):
-    """Levée lorsque l'extraction des données du catalogue échoue."""
+# La requête SQL d'agrégation
+SQL_SALES_BY_COUNTRY = """
+    SELECT
+        f.country_code,
+        c.country_name,
+        COUNT(DISTINCT f.order_id)    AS total_orders,
+        SUM(f.quantity)               AS total_quantity,
+        ROUND(SUM(f.revenue_gbp), 2)  AS total_revenue_gbp,
+        ROUND(SUM(f.revenue_eur), 2)  AS total_revenue_eur
+    FROM fact_orders f
+    LEFT JOIN dim_country c ON c.country_code = f.country_code
+    GROUP BY f.country_code, c.country_name
+    ORDER BY total_revenue_eur DESC
+"""
+
 
 # ------------------------------------------------------------------------------------------- #
 # 1. Extraction #
@@ -43,12 +55,11 @@ def extract_sales():
 
 def extract_reference():
     """Lit les données de référence dans la base SQLite."""
-    # sqlite3.connect crée une base vide si le fichier n'existe pas
+    # sqlite3.connect crée une base vide si le fichier n'existe pas : on vérifie avant
     if not Path(DB_REFERENCE).exists():
         raise SystemExit(f"Erreur : base introuvable : {DB_REFERENCE}")
 
-    # utiliser closing permet d'ouvrir et de fermer automatiquement la connection à la base sqlite qui doit obligatoirement être fermé.
-    # cette fonction permet la fermeture même en cas d'échec du code.
+    # closing ferme automatiquement la connexion, même en cas d'erreur
     with closing(sqlite3.connect(DB_REFERENCE)) as con:
         df_pays = pd.read_sql_query(
             "SELECT country_code, country_name, currency_code, region, is_active FROM countries",
@@ -58,165 +69,208 @@ def extract_reference():
             "SELECT channel_code, channel_name, channel_group, is_active FROM channels",
             con,
         )
-        df_categories = pd.read_sql_query(
-            "SELECT category_name, margin_rate, strategic_flag, default_channel_code, is_active FROM category_rules",
-            con,
-        )
         # Requête avec filtre : pays inactifs
         df_pays_inactifs = pd.read_sql_query(
             "SELECT country_code, country_name FROM countries WHERE is_active = 0",
             con,
         )
-        # Requête avec filtre : pays actifs
-        df_pays_actifs = pd.read_sql_query(
-            "SELECT country_code, country_name FROM countries WHERE is_active = 1",
-            con,
-        )
 
-    return df_pays, df_canaux, df_pays_inactifs, df_pays_actifs, df_categories
+    return df_pays, df_canaux, df_pays_inactifs
 
-def _http_get(url: str, timeout: int = 10) -> requests.Response:
-    """Effectue une requête HTTP GET avec gestion des erreurs réseau et statuts HTTP."""
+
+def scrape_catalog():
+    """Scrape la première page du catalogue : titre complet et prix en livres (£)."""
     try:
-        response = requests.get(
-            url,
-            timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; CatalogScraper/1.0)"},
-        )
+        response = requests.get(CATALOG_URL, timeout=10)
         response.raise_for_status()
-        return response
-    except requests.RequestException as exc:
-        raise ExtractionError(f"Échec de la requête HTTP vers {url} : {exc}") from exc
+    except requests.RequestException as erreur:
+        raise SystemExit(f"Erreur : site inaccessible ({CATALOG_URL}) : {erreur}")
 
-def scrape_catalog(url: str = CATALOG_URL) -> pd.DataFrame:
-    """Scrape la première page du catalogue : titre complet et prix en livres.
-
-    Le titre complet est lu dans l'attribut `title` du lien : le texte affiché
-    est tronqué par le site pour les titres longs.
-    """
-    response = _http_get(url)
+    # On donne response.content (et pas .text) pour éviter les problèmes d'encodage du symbole £
     soup = BeautifulSoup(response.content, "html.parser")
 
-    rows = []
-    for pod in soup.select("article.product_pod"):
-        link = pod.select_one("h3 a")
-        price_tag = pod.select_one("p.price_color")
-        if link is None or price_tag is None:
-            logger.warning("Fiche livre incomplète ignorée")
-            continue
-        match = re.search(r"\d+(?:\.\d+)?", price_tag.get_text())
-        if match is None:
-            logger.warning("Prix illisible pour %r ignoré", link.get("title"))
-            continue
-        rows.append({"title": link.get("title", "").strip(), "price_gbp": float(match.group())})
+    livres = []
+    for fiche in soup.select("article.product_pod"):
+        # Le titre complet est dans l'attribut "title" du lien : le texte affiché est tronqué
+        titre = fiche.select_one("h3 a")["title"]
+        # Le prix est écrit "£51.77" : on garde uniquement le nombre
+        texte_prix = fiche.select_one("p.price_color").get_text()
+        prix = float(re.search(r"\d+\.\d+", texte_prix).group())
+        livres.append({"title": titre, "price_gbp": prix})
 
-    if not rows:
-        raise ExtractionError("Aucun livre trouvé : la structure de la page a peut-être changé.")
-    logger.info("Scraping : %d livres récupérés", len(rows))
-    return pd.DataFrame(rows)
+    if not livres:
+        raise SystemExit("Erreur : aucun livre trouvé sur la page (la structure du site a changé ?)")
+    print(f"Catalogue : {len(livres)} livres récupérés")
+    return pd.DataFrame(livres)
 
-def fetch_exchange_rate() -> dict:
+
+def fetch_exchange_rate():
     """Récupère le taux GBP -> EUR via l'API publique Frankfurter."""
     # Il n'y a pas de ventes hors UE, donc on ne gère pas d'autres devises pour l'instant.
-    # Les pays europèens concernés par les ventes n'utilisent pas d'autres type de devises.
-    last_exc: Exception | None = None
-    for url, params in FRANKFURTER_ENDPOINTS:
-        try:
-            data = _http_get(url, params=params).json()
-            rate = float(data["rates"]["EUR"])
-            if rate <= 0:
-                raise ValueError(f"taux invalide : {rate}")
-            logger.info("Taux de change GBP->EUR : %s (date %s)", rate, data.get("date"))
-            return {
-                "rate_date": str(data["date"]),
-                "base_currency": "GBP",
-                "quote_currency": "EUR",
-                "rate": rate,
-            }
-        except (ExtractionError, KeyError, TypeError, ValueError) as exc:
-            last_exc = exc
-            logger.warning("Endpoint Frankfurter inutilisable (%s) : %s", url, exc)
-    raise ExtractionError("Taux de change indisponible") from last_exc
+    # Les pays européens concernés par les ventes n'utilisent pas d'autres types de devises.
+    # L'ensemble des prix est exprimé en £
+    try:
+        response = requests.get(
+            FRANKFURTER_URL, params={"base": "GBP", "symbols": "EUR"}, timeout=10
+        )
+        response.raise_for_status()
+        data = response.json()
+        taux = data["rates"]["EUR"]
+        date_taux = data["date"]
+    except (requests.RequestException, KeyError, ValueError) as erreur:
+        raise SystemExit(f"Erreur : taux de change indisponible : {erreur}")
+
+    print(f"Taux de change GBP -> EUR : {taux} (date {date_taux})")
+    return {"rate_date": date_taux, "base_currency": "GBP", "quote_currency": "EUR", "rate": taux}
 
 
 # ------------------------------------------------------------------------------------------- #
-# 2. Transformation - Nettoyage - Implementation #
+# 2. Transformation - Nettoyage - Enrichissement #
 # ------------------------------------------------------------------------------------------- #
-def clean_sales(df_sales: pd.DataFrame) -> pd.DataFrame:
+
+def clean_sales(df_sales):
     """Nettoie les ventes et retire les données personnelles (RGPD)."""
-    # RGPD : les noms et prénoms ne sont pas nécessaires à l'usage final.
-    df = df_sales.drop(columns=PERSONAL_COLUMNS, errors="ignore").copy()
-    initial = len(df)
+    # RGPD : on supprime les noms et prénoms dès le début
+    df = df_sales.drop(columns=PERSONAL_COLUMNS)
+    nb_avant = len(df)
 
-    # Retirer les lignes sans identifiant AVANT de convertir en texte : NaN deviendrait la chaîne "nan" et ne serait plus détecté.
-    missing_ids = df["order_id"].isna() | df["book_id"].isna()
-    if missing_ids.any():
-        logger.warning("%d commande(s) sans identifiant écartée(s)", int(missing_ids.sum()))
-    df = df[~missing_ids].copy() # Retirer les lignes sans identifiant
-
-    for col in ["order_id", "book_id", "country_code", "channel_code", "book_name"]:
-        df[col] = df[col].astype(str).str.strip()
-    df["country_code"] = df["country_code"].str.upper()
-    df["channel_code"] = df["channel_code"].str.upper()
-
-    # Retirer les lignes avec identifiant vide s'il y a des espaces ou des chaînes vides
-    empty_ids = (df["order_id"] == "") | (df["book_id"] == "")
-    df = df[~empty_ids].copy() # Retirer les lignes avec identifiant vide
-
-    # Retirer les doublons sur order_id, par défaut la première occurrence est conservée
+    # Doublons : une commande ne doit apparaître qu'une seule fois
     df = df.drop_duplicates(subset="order_id")
 
-    # Nettoyage des colonnes numériques et date (les données invalides sont converties en NaN)
-    df["order_date"] = pd.to_datetime(df["order_date"],format="%d/%m/%Y", errors="coerce")
-    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce")
-    df["discount_rate"] = pd.to_numeric(df["discount_rate"], errors="coerce")
+    # Valeurs manquantes : on supprime les lignes incomplètes
+    df = df.dropna()
 
-    # Retirer les lignes invalides : date manquante, quantité <= 0, taux de remise invalide
-    invalid = (
-        df["order_date"].isna()
-        | df["quantity"].isna() | (df["quantity"] <= 0)
-        | df["discount_rate"].isna() | ~df["discount_rate"].between(0, 1)
+    # Formats : espaces en trop, majuscules pour les codes, date au format AAAA-MM-JJ
+    for colonne in ["order_id", "book_id", "country_code", "channel_code", "book_name"]:
+        df[colonne] = df[colonne].str.strip()
+    df["country_code"] = df["country_code"].str.upper()
+    df["channel_code"] = df["channel_code"].str.upper()
+    df["order_date"] = pd.to_datetime(df["order_date"], format="%Y-%m-%d", errors="coerce")
+
+    # Valeurs incohérentes : date illisible, quantité <= 0, remise hors de 0 à 1
+    valide = (
+        df["order_date"].notna()
+        & (df["quantity"] > 0)
+        & df["discount_rate"].between(0, 1)
     )
-    if invalid.any():
-        logger.warning("%d commande(s) invalide(s) écartée(s)", int(invalid.sum()))
-    df = df[~invalid].copy()
-
-    df["quantity"] = df["quantity"].astype(int)
+    df = df[valide].copy()
     df["order_date"] = df["order_date"].dt.strftime("%Y-%m-%d")
-    logger.info("Nettoyage : %d -> %d commandes", initial, len(df))
+
+    print(f"Nettoyage : {nb_avant} -> {len(df)} commandes")
     if df.empty:
-        raise sqlite3.DataError("Aucune commande valide après nettoyage.")
+        raise SystemExit("Erreur : aucune commande valide après nettoyage")
     return df.reset_index(drop=True)
 
-# Normalisation du titre pour la jointure entre les ventes et le catalogue : suppression des espaces superflus et mise en minuscule.
-def normalize_title(title: str) -> str:
-    """Clé de jointure tolérante : espaces et casse ignorés."""
-    return re.sub(r"\s+", " ", str(title)).strip().casefold()
 
-def enrich_sales(sales: pd.DataFrame, catalog: pd.DataFrame, rate: float) -> pd.DataFrame:
-    """Ajoute le prix scrapé puis calcule le chiffre d'affaires en GBP et en EUR.
+def enrich_sales(df_sales, df_catalogue, taux):
+    """Ajoute le prix du catalogue, puis calcule le chiffre d'affaires en £ et en €."""
+    # On associe chaque vente à son prix grâce au titre du livre
+    df = df_sales.merge(df_catalogue, left_on="book_name", right_on="title", how="left")
+    df = df.drop(columns="title")
 
-    revenue_gbp = prix_gbp x quantité x (1 - remise)
-    revenue_eur = revenue_gbp x taux GBP->EUR
-    """
-    catalog = catalog.assign(title_key=catalog["title"].map(normalize_title))
-    catalog = catalog.drop_duplicates("title_key")[["title_key", "price_gbp"]]
-
-    df = sales.assign(title_key=sales["book_name"].map(normalize_title))
-    df = df.merge(catalog, on="title_key", how="left").drop(columns="title_key")
-
-    unmatched = df["price_gbp"].isna()
-    if unmatched.all():
-        raise sqlite3.DataError("Aucun livre des ventes ne correspond au catalogue scrapé.")
-    if unmatched.any():
-        titles = sorted(df.loc[unmatched, "book_name"].unique())
-        logger.warning("%d commande(s) écartée(s), prix introuvable pour : %s",
-                       int(unmatched.sum()), titles)
-        df = df[~unmatched].copy()
+    # Livres de la vente absents du catalogue (page 1 seulement) : on prévient et on les écarte
+    sans_prix = df["price_gbp"].isna()
+    if sans_prix.any():
+        print(f"Attention : {sans_prix.sum()} commande(s) sans prix dans le catalogue, écartée(s)")
+        df = df[~sans_prix].copy()
+    if df.empty:
+        raise SystemExit("Erreur : aucun livre des ventes ne correspond au catalogue")
 
     df["revenue_gbp"] = df["price_gbp"] * df["quantity"] * (1 - df["discount_rate"])
-    df["revenue_eur"] = df["revenue_gbp"] * rate
-    return df.reset_index(drop=True)
+    df["revenue_eur"] = df["revenue_gbp"] * taux
+    return df
+
+
+def aggregate_by_country(orders, dim_country):
+    """Agrégation sales_by_country, calculée en SQL."""
+    # SQL ne s'exécute que sur une base : on copie les deux DataFrames dans une base en mémoire
+    with closing(sqlite3.connect(":memory:")) as con:
+        orders.to_sql("fact_orders", con, index=False)
+        dim_country.to_sql("dim_country", con, index=False)
+        # On exécute la requête et on récupère le résultat dans un DataFrame
+        return pd.read_sql_query(SQL_SALES_BY_COUNTRY, con)
+
+
+def transform(df_sales, df_catalogue, rate_info, df_pays, df_canaux):
+    """Produit l'ensemble des tables de la base finale."""
+    sales = clean_sales(df_sales)
+    orders = enrich_sales(sales, df_catalogue, rate_info["rate"])
+
+    # Table des pays : le référentiel (sans is_active)
+    dim_country = df_pays[["country_code", "country_name", "currency_code", "region"]]
+    # Les Pays-Bas (NL) ont des ventes mais sont absents du référentiel : on les ajoute à la main
+    if "NL" not in dim_country["country_code"].values:
+        ligne_nl = pd.DataFrame([{
+            "country_code": "NL", "country_name": "Netherlands",
+            "currency_code": "EUR", "region": "Europe",
+        }])
+        dim_country = pd.concat([dim_country, ligne_nl], ignore_index=True)
+        print("Attention : NL absent du référentiel, ajouté à la main (Netherlands)")
+
+    dim_channel = df_canaux[["channel_code", "channel_name", "channel_group"]]
+
+    dim_book = (
+        orders[["book_id", "book_name", "price_gbp"]]
+        .drop_duplicates("book_id")
+        .rename(columns={"book_name": "title"})
+        .sort_values("book_id")
+    )
+
+    fact_orders = orders[[
+        "order_id", "order_date", "book_id", "country_code", "channel_code",
+        "quantity", "discount_rate", "revenue_gbp", "revenue_eur",
+    ]]
+
+    return {
+        "dim_country": dim_country,
+        "dim_channel": dim_channel,
+        "dim_book": dim_book,
+        "fx_rates": pd.DataFrame([rate_info]),
+        "fact_orders": fact_orders,
+        "sales_by_country": aggregate_by_country(orders, dim_country),
+    }
+
+
+# ------------------------------------------------------------------------------------------- #
+# 3. Chargement #
+# ------------------------------------------------------------------------------------------- #
+
+def load_final_db(tables):
+    """Crée la base finale à partir de schema_final.sql, puis la remplit avec les tables."""
+    # Le fichier schema_final.sql doit être dans le même dossier que pipeline.py
+    if not Path(SCHEMA_FILE).exists():
+        raise SystemExit(f"Erreur : schéma introuvable : {SCHEMA_FILE}")
+
+    # On repart d'une base vide à chaque exécution : le pipeline peut être relancé sans problème
+    Path(FINAL_DB).unlink(missing_ok=True)
+
+    try:
+        with closing(sqlite3.connect(FINAL_DB)) as con:
+            # Active le contrôle des clés étrangères (désactivé par défaut dans SQLite)
+            con.execute("PRAGMA foreign_keys = ON")
+
+            # 1) Création des tables vides (le schéma ne contient AUCUNE colonne nominative : RGPD)
+            con.executescript(Path(SCHEMA_FILE).read_text(encoding="utf-8"))
+
+            # 2) Remplissage des tables dans le bon ordre
+            for nom in LOAD_ORDER:
+                tables[nom].to_sql(nom, con, if_exists="append", index=False)
+                print(f"Table {nom} chargée : {len(tables[nom])} lignes")
+
+            # 3) Vérification : chaque clé étrangère doit pointer vers une ligne qui existe
+            if con.execute("PRAGMA foreign_key_check").fetchall():
+                raise ValueError("clés étrangères incohérentes")
+
+            con.commit()
+    except Exception as erreur:
+        # En cas d'échec, on supprime la base à moitié remplie pour ne pas laisser un fichier faux
+        Path(FINAL_DB).unlink(missing_ok=True)
+        raise SystemExit(f"Erreur : chargement impossible dans {FINAL_DB} : {erreur}")
+
+
+# ------------------------------------------------------------------------------------------- #
+# Programme principal #
+# ------------------------------------------------------------------------------------------- #
 
 def run_pipeline():
     # Lecture du csv des ventes
@@ -224,18 +278,26 @@ def run_pipeline():
     print(f"Ventes : {len(df_sales)} lignes lues")
 
     # Lecture des données de référence (SQLite)
-    df_pays, df_canaux, df_pays_inactifs, df_pays_actifs, df_categories = extract_reference()
-    print(f"Pays : {len(df_pays)} | Canaux : {len(df_canaux)}")
-    print(f"Pays inactifs : {len(df_pays_inactifs)} | Pays actifs : {len(df_pays_actifs)}")
+    df_pays, df_canaux, df_pays_inactifs = extract_reference()
+    print(f"Pays : {len(df_pays)} | Canaux : {len(df_canaux)} | Pays inactifs : {len(df_pays_inactifs)}")
 
-    try:
-        df_catalogue = scrape_catalog()
-    except ExtractionError as exc:
-        raise SystemExit(f"Erreur : {exc}") from exc
+    # Pays inactifs qui ont quand même des ventes : on les garde, mais on prévient
+    inactifs_avec_ventes = set(df_pays_inactifs["country_code"]) & set(df_sales["country_code"])
+    if inactifs_avec_ventes:
+        print(f"Attention : pays inactifs avec des ventes (conservées) : {sorted(inactifs_avec_ventes)}")
 
-    return df_sales, df_pays, df_canaux, df_catalogue
+    # Site web et API de taux de change
+    df_catalogue = scrape_catalog()
+    rate_info = fetch_exchange_rate()
+
+    # Nettoyage, enrichissement, agrégation, puis chargement dans la base finale
+    tables = transform(df_sales, df_catalogue, rate_info, df_pays, df_canaux)
+    load_final_db(tables)
+    return tables
 
 
 if __name__ == "__main__":
-    df_sales, df_pays, df_canaux, df_catalogue = run_pipeline()
+    tables = run_pipeline()
+    print(tables["sales_by_country"].to_string(index=False))
+    print(f"Base finale créée : {FINAL_DB}")
     print("Pipeline exécuté avec succès.")

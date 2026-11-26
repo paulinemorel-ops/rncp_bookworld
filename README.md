@@ -14,7 +14,7 @@ API Frankfurter (GBP→EUR)┘
 Prérequis : Python 3.10 ou supérieur.
 
 ```bash
-git clone <url-du-depot>
+git clone <https://github.com/paulinemorel-ops/rncp_bookworld>
 cd bookworld
 
 python -m venv .venv
@@ -31,7 +31,7 @@ python pipeline.py
 
 Le pipeline :
 
-1. lit `sales_raw.csv` et la base `bookworld_reference.db` ;
+1. lit `base_de_données_bookworld.csv` et la base `bookworld_reference.db` ;
 2. scrape la première page de <https://books.toscrape.com/> (titres et prix en £) ;
 3. récupère le taux GBP → EUR via l'API publique [Frankfurter](https://frankfurter.dev) ;
 4. nettoie les ventes, **supprime les noms et prénoms (RGPD)**, calcule le chiffre d'affaires
@@ -98,7 +98,7 @@ git init
 git add .
 git commit -m "Projet BookWorld"
 git branch -M main
-git remote add origin https://github.com/<utilisateur>/<depot>.git
+git remote add origin https://github.com/paulinemorel-ops/rncp_bookworld
 git push -u origin main
 ```
 
@@ -108,7 +108,7 @@ ssh-keygen -t ed25519 -C "votre-email@exemple.com"
 cat ~/.ssh/id_ed25519.pub        # à copier dans GitHub → Settings → SSH and GPG keys
 ssh -T git@github.com            # vérification
 
-git remote add origin git@github.com:<utilisateur>/<depot>.git
+git remote add origin git@github.com:paulinemorel-ops/rncp_bookworld.git
 git push -u origin main
 ```
 

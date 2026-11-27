@@ -14,8 +14,8 @@ API Frankfurter (GBP→EUR)┘
 Prérequis : Python 3.10 ou supérieur.
 
 ```bash
-git clone <url-du-depot>
-cd bookworld
+git clone https://github.com/paulinemorel-ops/rncp_bookworld.git
+cd rncp_bookworld
 
 python -m venv .venv
 source .venv/bin/activate          # Windows PowerShell : .venv\Scripts\Activate.ps1
@@ -52,9 +52,9 @@ L'API refuse de démarrer sans token. Définissez-le dans une variable d'environ
 
 ```bash
 # Linux / macOS
-export API_TOKEN="remplacez-par-un-secret-long-et-aleatoire"
+export API_TOKEN="RNCP_pmorel_08122026"
 # Windows PowerShell
-$env:API_TOKEN = "remplacez-par-un-secret-long-et-aleatoire"
+$env:API_TOKEN = "RNCP_pmorel_08122026"
 
 python api.py          # écoute sur http://127.0.0.1:8000
 ```
@@ -76,8 +76,7 @@ Le token est envoyé dans l'en-tête `Authorization` :
 curl http://127.0.0.1:8000/health
 # {"status":"ok"}
 
-curl -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:8000/sales-by-country
-# {"count":8,"data":[{"country_code":"FR","country_name":"France","total_orders":56,...}, ...]}
+curl -H "Authorization: Bearer RNCP_pmorel_08122026" http://127.0.0.1:8000/sales-by-country
 
 curl -i http://127.0.0.1:8000/sales-by-country
 # HTTP/1.1 401 UNAUTHORIZED   (token absent ou invalide)
@@ -85,9 +84,61 @@ curl -i http://127.0.0.1:8000/sales-by-country
 
 Codes de retour : `200` succès, `401` token manquant ou invalide, `503` base finale indisponible (lancez d'abord `pipeline.py`).
 
+### Exemple de réponse JSON
+
+L'API renvoie ses réponses avec la fonction `jsonify` de Flask, qui transforme un dictionnaire Python en JSON :
+
+```python
+return jsonify(count=len(data), data=data)
+```
+
+Réponse de `GET /sales-by-country` (avec un token valide), tronquée à deux pays. Les pays sont triés par chiffre d'affaires en € décroissant :
+
+```json
+{
+  "count": 8,
+  "data": [
+    {
+      "country_code": "DE",
+      "country_name": "Germany",
+      "total_orders": 40,
+      "total_quantity": 110,
+      "total_revenue_gbp": 4014.7,
+      "total_revenue_eur": 4793.56,
+      "avg_basket_eur": 119.84,
+      "pct_quantity": 18.2
+    },
+    {
+      "country_code": "FR",
+      "country_name": "France",
+      "total_orders": 56,
+      "total_quantity": 130,
+      "total_revenue_gbp": 3979.2,
+      "total_revenue_eur": 4751.17,
+      "avg_basket_eur": 84.84,
+      "pct_quantity": 21.6
+    }
+  ]
+}
+```
+
+Réponse en cas d'erreur :
+
+```json
+{"error": "Token manquant ou invalide"}
+```
+
+(code HTTP `401`) ou, si la base n'existe pas :
+
+```json
+{"error": "Base finale indisponible : lancez d'abord pipeline.py"}
+```
+
+(code HTTP `503`). Les montants en € dépendent du taux de change du jour du lancement du pipeline.
+
 ## 5. Publier sur GitHub : token ou clé SSH
 
-Deux méthodes d'authentification pour `git push` (GitHub n'accepte plus le mot de passe du compte) :
+Deux méthodes d'authentification pour `git push`, **au choix** (n'utilisez qu'un seul `git remote add origin`) :
 
 **Option A – Personal Access Token (HTTPS)**
 1. GitHub → *Settings* → *Developer settings* → *Personal access tokens* → générer un token avec le droit `repo`.
@@ -98,7 +149,7 @@ git init
 git add .
 git commit -m "Projet BookWorld"
 git branch -M main
-git remote add origin https://github.com/<utilisateur>/<depot>.git
+git remote add origin https://github.com/paulinemorel-ops/rncp_bookworld.git
 git push -u origin main
 ```
 
@@ -106,13 +157,14 @@ git push -u origin main
 ```bash
 ssh-keygen -t ed25519 -C "votre-email@exemple.com"
 cat ~/.ssh/id_ed25519.pub        # à copier dans GitHub → Settings → SSH and GPG keys
+                                 # Windows PowerShell : Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub
 ssh -T git@github.com            # vérification
 
-git remote add origin git@github.com:<utilisateur>/<depot>.git
+git remote add origin git@github.com:paulinemorel-ops/rncp_bookworld.git
 git push -u origin main
 ```
 
-Ne jamais committer un token ou une clé privée (le fichier `.env` est ignoré par `.gitignore`).
+Ne jamais committer un token GitHub ou une clé privée.
 
 ## 6. Fichiers du projet
 

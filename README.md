@@ -52,9 +52,9 @@ L'API refuse de démarrer sans token. Définissez-le dans une variable d'environ
 
 ```bash
 # Linux / macOS
-export API_TOKEN="RNCP_pmorel_08122026"
+export API_TOKEN="remplacez-par-un-secret-de-votre-choix"
 # Windows PowerShell
-$env:API_TOKEN = "RNCP_pmorel_08122026"
+$env:API_TOKEN = "remplacez-par-un-secret-de-votre-choix"
 
 python api.py          # écoute sur http://127.0.0.1:8000
 ```
@@ -73,10 +73,12 @@ Exécutez d'abord `python pipeline.py` : l'API lit la table `sales_by_country` d
 Le token est envoyé dans l'en-tête `Authorization` :
 
 ```bash
+# Windows PowerShell : remplacer "curl" par "curl.exe"
 curl http://127.0.0.1:8000/health
 # {"status":"ok"}
 
-curl -H "Authorization: Bearer RNCP_pmorel_08122026" http://127.0.0.1:8000/sales-by-country
+curl -H "Authorization: Bearer remplacez-par-votre-token" http://127.0.0.1:8000/sales-by-country
+# {"count":8,"data":[{"country_code":"DE","country_name":"Germany","total_orders":40,...}, ...]}
 
 curl -i http://127.0.0.1:8000/sales-by-country
 # HTTP/1.1 401 UNAUTHORIZED   (token absent ou invalide)
